@@ -266,7 +266,7 @@ start_pipeline (void)
       gst_parse_launch ("webrtcbin name=sendrecv " STUN_SERVER
       "videotestsrc pattern=ball ! queue ! vp8enc deadline=1 ! rtpvp8pay ! "
       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
-      "audiotestsrc wave=red-noise ! queue ! opusenc ! rtpopuspay ! "
+      "pulsesrc ! queue ! opusenc ! rtpopuspay ! "
       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ",
       &error);
 
