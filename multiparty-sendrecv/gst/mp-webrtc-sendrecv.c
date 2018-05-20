@@ -8,6 +8,7 @@
  */
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
+#define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
 
 /* For signalling */
@@ -48,12 +49,14 @@ static const gchar *default_server_url = "wss://webrtc.nirbheek.in:8443";
 static gchar *server_url = NULL;
 static gchar *local_id = NULL;
 static gchar *room_id = NULL;
+static gboolean strict_ssl = TRUE;
 
 static GOptionEntry entries[] =
 {
   { "name", 0, 0, G_OPTION_ARG_STRING, &local_id, "Name we will send to the server", "ID" },
   { "room-id", 0, 0, G_OPTION_ARG_STRING, &room_id, "Room name to join or create", "ID" },
   { "server", 0, 0, G_OPTION_ARG_STRING, &server_url, "Signalling server to connect to", "URL" },
+  { NULL }
 };
 
 static gint
@@ -326,7 +329,6 @@ add_peer_to_pipeline (const gchar * peer_id, gboolean offer)
   gchar *tmp;
   GstElement *tee, *webrtc, *q;
   GstPad *srcpad, *sinkpad;
-  GError *error = NULL;
 
   tmp = g_strdup_printf ("queue-%s", peer_id);
   q = gst_element_factory_make ("queue", tmp);
@@ -618,7 +620,7 @@ handle_sdp_offer (const gchar * peer_id, const gchar * text)
   ret = gst_sdp_message_new (&sdp);
   g_assert_cmpint (ret, ==, GST_SDP_OK);
 
-  ret = gst_sdp_message_parse_buffer (text, strlen (text), sdp);
+  ret = gst_sdp_message_parse_buffer ((guint8 *) text, strlen (text), sdp);
   g_assert_cmpint (ret, ==, GST_SDP_OK);
 
   offer = gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_OFFER, sdp);
@@ -658,7 +660,7 @@ handle_sdp_answer (const gchar * peer_id, const gchar * text)
   ret = gst_sdp_message_new (&sdp);
   g_assert_cmpint (ret, ==, GST_SDP_OK);
 
-  ret = gst_sdp_message_parse_buffer (text, strlen (text), sdp);
+  ret = gst_sdp_message_parse_buffer ((guint8 *) text, strlen (text), sdp);
   g_assert_cmpint (ret, ==, GST_SDP_OK);
 
   answer = gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
@@ -699,10 +701,7 @@ handle_peer_message (const gchar * peer_id, const gchar * msg)
   object = json_node_get_object (root);
   /* Check type of JSON message */
   if (json_object_has_member (object, "sdp")) {
-    int ret;
-    GstSDPMessage *sdp;
     const gchar *text, *sdp_type;
-    GstWebRTCSessionDescription *answer;
 
     g_assert_cmpint (app_state, >=, ROOM_JOINED);
 
@@ -873,7 +872,7 @@ connect_to_websocket_server_async (void)
   SoupSession *session;
   const char *https_aliases[] = {"wss", NULL};
 
-  session = soup_session_new_with_options (SOUP_SESSION_SSL_STRICT, TRUE,
+  session = soup_session_new_with_options (SOUP_SESSION_SSL_STRICT, strict_ssl,
       SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
       //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
       SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
@@ -892,10 +891,33 @@ connect_to_websocket_server_async (void)
   app_state = SERVER_CONNECTING;
 }
 
+static gboolean
+check_plugins (void)
+{
+  int i;
+  gboolean ret;
+  GstPlugin *plugin;
+  GstRegistry *registry;
+  const gchar *needed[] = { "opus", "nice", "webrtc", "dtls", "srtp",
+      "rtpmanager", "audiotestsrc", NULL};
+
+  registry = gst_registry_get ();
+  ret = TRUE;
+  for (i = 0; i < g_strv_length ((gchar **) needed); i++) {
+    plugin = gst_registry_find_plugin (registry, needed[i]);
+    if (!plugin) {
+      g_print ("Required gstreamer plugin '%s' not found\n", needed[i]);
+      ret = FALSE;
+      continue;
+    }
+    gst_object_unref (plugin);
+  }
+  return ret;
+}
+
 int
 main (int argc, char *argv[])
 {
-  SoupSession *session;
   GOptionContext *context;
   GError *error = NULL;
 
@@ -906,6 +928,9 @@ main (int argc, char *argv[])
     g_printerr ("Error initializing: %s\n", error->message);
     return -1;
   }
+
+  if (!check_plugins ())
+    return -1;
 
   if (!room_id) {
     g_printerr ("--room-id is a required argument\n");
@@ -922,6 +947,16 @@ main (int argc, char *argv[])
 
   if (!server_url)
     server_url = g_strdup (default_server_url);
+
+  /* Don't use strict ssl when running a localhost server, because
+   * it's probably a test server with a self-signed certificate */
+  {
+    GstUri *uri = gst_uri_from_string (server_url);
+    if (g_strcmp0 ("localhost", gst_uri_get_host (uri)) == 0 ||
+        g_strcmp0 ("127.0.0.1", gst_uri_get_host (uri)) == 0)
+      strict_ssl = FALSE;
+    gst_uri_unref (uri);
+  }
 
   loop = g_main_loop_new (NULL, FALSE);
 

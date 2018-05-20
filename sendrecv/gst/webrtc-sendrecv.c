@@ -48,6 +48,7 @@ static SoupWebsocketConnection *ws_conn = NULL;
 static enum AppState app_state = 0;
 static const gchar *peer_id = NULL;
 static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
+static gboolean strict_ssl = TRUE;
 
 static audioresource_t *resource;
 
@@ -55,6 +56,7 @@ static GOptionEntry entries[] =
 {
   { "peer-id", 0, 0, G_OPTION_ARG_STRING, &peer_id, "String ID of the peer to connect to", "ID" },
   { "server", 0, 0, G_OPTION_ARG_STRING, &server_url, "Signalling server to connect to", "URL" },
+  { NULL },
 };
 
 static gboolean
@@ -107,25 +109,41 @@ handle_media_stream (GstPad * pad, GstElement * pipe, const char * convert_name,
     const char * sink_name)
 {
   GstPad *qpad;
-  GstElement *q, *conv, *sink;
+  GstElement *q, *conv, *resample, *sink;
   GstPadLinkReturn ret;
 
+  g_print ("Trying to handle stream with %s ! %s", convert_name, sink_name);
+
   q = gst_element_factory_make ("queue", NULL);
-  g_assert (q);
+  g_assert_nonnull (q);
   conv = gst_element_factory_make (convert_name, NULL);
-  g_assert (conv);
+  g_assert_nonnull (conv);
   sink = gst_element_factory_make (sink_name, NULL);
-  g_assert (sink);
-  gst_bin_add_many (GST_BIN (pipe), q, conv, sink, NULL);
-  gst_element_sync_state_with_parent (q);
-  gst_element_sync_state_with_parent (conv);
-  gst_element_sync_state_with_parent (sink);
-  gst_element_link_many (q, conv, sink, NULL);
+  g_assert_nonnull (sink);
+
+  if (g_strcmp0 (convert_name, "audioconvert") == 0) {
+    /* Might also need to resample, so add it just in case.
+     * Will be a no-op if it's not required. */
+    resample = gst_element_factory_make ("audioresample", NULL);
+    g_assert_nonnull (resample);
+    gst_bin_add_many (GST_BIN (pipe), q, conv, resample, sink, NULL);
+    gst_element_sync_state_with_parent (q);
+    gst_element_sync_state_with_parent (conv);
+    gst_element_sync_state_with_parent (resample);
+    gst_element_sync_state_with_parent (sink);
+    gst_element_link_many (q, conv, resample, sink, NULL);
+  } else {
+    gst_bin_add_many (GST_BIN (pipe), q, conv, sink, NULL);
+    gst_element_sync_state_with_parent (q);
+    gst_element_sync_state_with_parent (conv);
+    gst_element_sync_state_with_parent (sink);
+    gst_element_link_many (q, conv, sink, NULL);
+  }
 
   qpad = gst_element_get_static_pad (q, "sink");
 
   ret = gst_pad_link (pad, qpad);
-  g_assert (ret == GST_PAD_LINK_OK);
+  g_assert_cmphex (ret, ==, GST_PAD_LINK_OK);
 }
 
 static void
@@ -227,11 +245,10 @@ on_offer_created (GstPromise * promise, gpointer user_data)
 {
   GstWebRTCSessionDescription *offer = NULL;
   const GstStructure *reply;
-  gchar *desc;
 
-  g_assert (app_state == PEER_CALL_NEGOTIATING);
+  g_assert_cmphex (app_state, ==, PEER_CALL_NEGOTIATING);
 
-  g_assert (gst_promise_wait(promise) == GST_PROMISE_RESULT_REPLIED);
+  g_assert_cmphex (gst_promise_wait(promise), ==, GST_PROMISE_RESULT_REPLIED);
   reply = gst_promise_get_reply (promise);
   gst_structure_get (reply, "offer",
       GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, NULL);
@@ -269,9 +286,9 @@ start_pipeline (void)
 
   pipe1 =
       gst_parse_launch ("webrtcbin name=sendrecv " STUN_SERVER
-      "videotestsrc pattern=ball ! queue ! vp8enc deadline=1 ! rtpvp8pay ! "
+      "videotestsrc pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay ! "
       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
-      "pulsesrc ! queue ! opusenc ! rtpopuspay ! "
+      "pulsesrc ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay ! "
       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ",
       &error);
 
@@ -282,7 +299,7 @@ start_pipeline (void)
   }
 
   webrtc1 = gst_bin_get_by_name (GST_BIN (pipe1), "sendrecv");
-  g_assert (webrtc1 != NULL);
+  g_assert_nonnull (webrtc1);
 
   /* This is the gstwebrtc entry point where we create the offer and so on. It
    * will be called when the pipeline goes to PLAYING. */
@@ -437,7 +454,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
   /* Look for JSON messages containing SDP and ICE candidates */
   } else {
     JsonNode *root;
-    JsonObject *object;
+    JsonObject *object, *child;
     JsonParser *parser = json_parser_new ();
     if (!json_parser_load_from_data (parser, text, -1, NULL)) {
       g_printerr ("Unknown message '%s', ignoring", text);
@@ -456,32 +473,39 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
     /* Check type of JSON message */
     if (json_object_has_member (object, "sdp")) {
       int ret;
-      const gchar *text;
       GstSDPMessage *sdp;
+      const gchar *text, *sdptype;
       GstWebRTCSessionDescription *answer;
 
-      g_assert (app_state == PEER_CALL_NEGOTIATING);
+      g_assert_cmphex (app_state, ==, PEER_CALL_NEGOTIATING);
 
-      g_assert (json_object_has_member (object, "type"));
+      child = json_object_get_object_member (object, "sdp");
+
+      if (!json_object_has_member (child, "type")) {
+        cleanup_and_quit_loop ("ERROR: received SDP without 'type'",
+            PEER_CALL_ERROR);
+        goto out;
+      }
+
+      sdptype = json_object_get_string_member (child, "type");
       /* In this example, we always create the offer and receive one answer.
        * See tests/examples/webrtcbidirectional.c in gst-plugins-bad for how to
        * handle offers from peers and reply with answers using webrtcbin. */
-      g_assert_cmpstr (json_object_get_string_member (object, "type"), ==,
-          "answer");
+      g_assert_cmpstr (sdptype, ==, "answer");
 
-      text = json_object_get_string_member (object, "sdp");
+      text = json_object_get_string_member (child, "sdp");
 
       g_print ("Received answer:\n%s\n", text);
 
       ret = gst_sdp_message_new (&sdp);
-      g_assert (ret == GST_SDP_OK);
+      g_assert_cmphex (ret, ==, GST_SDP_OK);
 
-      ret = gst_sdp_message_parse_buffer (text, strlen (text), sdp);
-      g_assert (ret == GST_SDP_OK);
+      ret = gst_sdp_message_parse_buffer ((guint8 *) text, strlen (text), sdp);
+      g_assert_cmphex (ret, ==, GST_SDP_OK);
 
       answer = gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_ANSWER,
           sdp);
-      g_assert (answer);
+      g_assert_nonnull (answer);
 
       /* Set remote description on our pipeline */
       {
@@ -494,13 +518,12 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
 
       app_state = PEER_CALL_STARTED;
     } else if (json_object_has_member (object, "ice")) {
-      JsonObject *ice;
       const gchar *candidate;
       gint sdpmlineindex;
 
-      ice = json_object_get_object_member (object, "ice");
-      candidate = json_object_get_string_member (ice, "candidate");
-      sdpmlineindex = json_object_get_int_member (ice, "sdpMLineIndex");
+      child = json_object_get_object_member (object, "ice");
+      candidate = json_object_get_string_member (child, "candidate");
+      sdpmlineindex = json_object_get_int_member (child, "sdpMLineIndex");
 
       /* Add ice candidate sent by remote peer */
       g_signal_emit_by_name (webrtc1, "add-ice-candidate", sdpmlineindex,
@@ -528,7 +551,7 @@ on_server_connected (SoupSession * session, GAsyncResult * res,
     return;
   }
 
-  g_assert (ws_conn != NULL);
+  g_assert_nonnull (ws_conn);
 
   app_state = SERVER_CONNECTED;
   g_print ("Connected to signalling server\n");
@@ -551,7 +574,7 @@ connect_to_websocket_server_async (void)
   SoupSession *session;
   const char *https_aliases[] = {"wss", NULL};
 
-  session = soup_session_new_with_options (SOUP_SESSION_SSL_STRICT, TRUE,
+  session = soup_session_new_with_options (SOUP_SESSION_SSL_STRICT, strict_ssl,
       SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
       //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
       SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
@@ -583,11 +606,32 @@ on_acquired(audioresource_t *audio_resource, bool acquired, void *user_data)
   }
 }
 
+static gboolean
+check_plugins (void)
+{
+  int i;
+  gboolean ret;
+  GstPlugin *plugin;
+  GstRegistry *registry;
+  const gchar *needed[] = { "opus", "vpx", "nice", "webrtc", "dtls", "srtp",
+      "rtpmanager", "videotestsrc", "audiotestsrc", NULL};
 
+  registry = gst_registry_get ();
+  ret = TRUE;
+  for (i = 0; i < g_strv_length ((gchar **) needed); i++) {
+    plugin = gst_registry_find_plugin (registry, needed[i]);
+    if (!plugin) {
+      g_print ("Required gstreamer plugin '%s' not found\n", needed[i]);
+      ret = FALSE;
+      continue;
+    }
+    gst_object_unref (plugin);
+  }
+  return ret;
+}
 int
 main (int argc, char *argv[])
 {
-  SoupSession *session;
   GOptionContext *context;
   GError *error = NULL;
   void *user_data = NULL;
@@ -603,9 +647,22 @@ main (int argc, char *argv[])
     return -1;
   }
 
+  if (!check_plugins ())
+    return -1;
+
   if (!peer_id) {
     g_printerr ("--peer-id is a required argument\n");
     return -1;
+  }
+
+  /* Don't use strict ssl when running a localhost server, because
+   * it's probably a test server with a self-signed certificate */
+  {
+    GstUri *uri = gst_uri_from_string (server_url);
+    if (g_strcmp0 ("localhost", gst_uri_get_host (uri)) == 0 ||
+        g_strcmp0 ("127.0.0.1", gst_uri_get_host (uri)) == 0)
+      strict_ssl = FALSE;
+    gst_uri_unref (uri);
   }
 
   loop = g_main_loop_new (NULL, FALSE);
@@ -613,11 +670,13 @@ main (int argc, char *argv[])
   connect_to_websocket_server_async ();
 
   g_main_loop_run (loop);
+  g_main_loop_unref (loop);
 
-  gst_element_set_state (GST_ELEMENT (pipe1), GST_STATE_NULL);
-  g_print ("Pipeline stopped\n");
-
-  gst_object_unref (pipe1);
+  if (pipe1) {
+    gst_element_set_state (GST_ELEMENT (pipe1), GST_STATE_NULL);
+    g_print ("Pipeline stopped\n");
+    gst_object_unref (pipe1);
+  }
 
   audioresource_release(resource);
   audioresource_free(resource);
