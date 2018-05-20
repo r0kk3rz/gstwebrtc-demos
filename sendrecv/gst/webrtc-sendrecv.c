@@ -16,6 +16,9 @@
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 
+/* For Sailfish Audio */
+#include <audioresource.h>
+
 #include <string.h>
 
 enum AppState {
@@ -45,6 +48,8 @@ static SoupWebsocketConnection *ws_conn = NULL;
 static enum AppState app_state = 0;
 static const gchar *peer_id = NULL;
 static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
+
+static audioresource_t *resource;
 
 static GOptionEntry entries[] =
 {
@@ -142,7 +147,7 @@ on_incoming_decodebin_stream (GstElement * decodebin, GstPad * pad,
   if (g_str_has_prefix (name, "video")) {
     handle_media_stream (pad, pipe, "videoconvert", "autovideosink");
   } else if (g_str_has_prefix (name, "audio")) {
-    handle_media_stream (pad, pipe, "audioconvert", "autoaudiosink");
+    handle_media_stream (pad, pipe, "audioconvert", "pulsesink");
   } else {
     g_printerr ("Unknown pad %s, ignoring", GST_PAD_NAME (pad));
   }
@@ -565,12 +570,30 @@ connect_to_websocket_server_async (void)
   app_state = SERVER_CONNECTING;
 }
 
+static void
+on_acquired(audioresource_t *audio_resource, bool acquired, void *user_data)
+{
+  if(acquired)
+  {
+    g_print("Audio Resource Acquired\n");
+  }
+  else
+  {
+    g_printerr("Failed to Acquire Audio Resource\n");
+  }
+}
+
+
 int
 main (int argc, char *argv[])
 {
   SoupSession *session;
   GOptionContext *context;
   GError *error = NULL;
+  void *user_data = NULL;
+
+  resource = audioresource_init(AUDIO_RESOURCE_MEDIA, on_acquired, user_data);
+  audioresource_acquire(resource);
 
   context = g_option_context_new ("- gstreamer webrtc sendrecv demo");
   g_option_context_add_main_entries (context, entries, NULL);
@@ -595,6 +618,9 @@ main (int argc, char *argv[])
   g_print ("Pipeline stopped\n");
 
   gst_object_unref (pipe1);
+
+  audioresource_release(resource);
+  audioresource_free(resource);
 
   return 0;
 }
