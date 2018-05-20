@@ -59,7 +59,7 @@ http://blog.nirbheek.in/2018/02/gstreamer-webrtc.html
 * Build the sources in the `gst/` directory on your machine
 
 ```console
-$ gcc webrtc-sendrecv.c $(pkg-config --cflags --libs gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libsoup-2.4 json-glib-1.0) -o webrtc-sendrecv
+$ gcc webrtc-sendrecv.c $(pkg-config --cflags --libs gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libsoup-2.4 json-glib-1.0 audioresource) -o webrtc-sendrecv
 ```
 
 * Open the website in a browser and ensure that the status is "Registered with server, waiting for call", and note the `id` too.
